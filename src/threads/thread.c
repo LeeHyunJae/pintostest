@@ -17,11 +17,11 @@
 
 /* Random value for struct thread's `magic' member.
    Used to detect stack overflow.  See the big comment at the top
-   of thread.h for details */
+   of thread.h for details. */
 #define THREAD_MAGIC 0xcd6abf4b
 
 /* List of processes in THREAD_READY state, that is, processes
-   that are ready to run but not actually running */
+   that are ready to run but not actually running. */
 static struct list ready_list;
 
 /* List of all processes.  Processes are added to this list
@@ -92,6 +92,9 @@ thread_init (void)
   lock_init (&tid_lock);
   list_init (&ready_list);
   list_init (&all_list);
+#ifdef USERPROG
+  process_init ();
+#endif
 
   /* Set up a thread structure for the running thread. */
   initial_thread = running_thread ();
@@ -182,6 +185,27 @@ thread_create (const char *name, int priority,
   /* Initialize thread. */
   init_thread (t, name, priority);
   tid = t->tid = allocate_tid ();
+#ifdef USERPROG
+  {
+	struct thread *cur = thread_current();
+	enum intr_level old_level;
+	int i;
+	for (i=0; t->name[i] != '\0' && i<sizeof(t->name); i++)
+		if (t->name[i] == ' ') {
+			t->name[i] = '\0';
+			break;
+		}
+
+	sema_init(&t->release_on_exit, 0);
+	sema_init(&t->release_on_wait, 0);
+	t->proc_parent = cur;
+	t->exit_code = -1;
+
+	old_level = intr_disable ();
+	list_push_back (&cur->proc_child_list, &t->proc_child_elem);
+	intr_set_level (old_level);
+  }
+#endif
 
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame (t, sizeof *kf);
@@ -284,6 +308,20 @@ thread_exit (void)
 
 #ifdef USERPROG
   process_exit ();
+
+  intr_disable ();
+  {
+	/* detach parent of children */
+	struct thread *t = thread_current();
+	struct thread *child;
+	struct list_elem *e;
+	for (e = list_begin (&t->proc_child_list); e != list_end (&t->proc_child_list);
+		e = list_next (e)) {
+		child = list_entry (e, struct thread, proc_child_elem);
+		child->proc_parent = NULL;
+		sema_up(&child->release_on_wait);
+	}
+  }
 #endif
 
   /* Remove thread from all threads list, set our status to dying,
@@ -295,6 +333,29 @@ thread_exit (void)
   schedule ();
   NOT_REACHED ();
 }
+
+struct thread*
+thread_find_child (struct thread *cur, tid_t tid)
+{
+	struct thread *t;
+	struct list_elem *e;
+	if (list_empty(&cur->proc_child_list))
+		return NULL;
+
+	for (e = list_begin (&cur->proc_child_list); e != list_end (&cur->proc_child_list);
+		e = list_next (e)) {
+		/* check itself */
+		t = list_entry (e, struct thread, proc_child_elem);
+		if (t->tid == tid)
+			return t;
+		/* check children */
+		t = thread_find_child (t, tid);
+		if (t)
+			return t;
+	}
+	return NULL;
+}
+
 
 /* Yields the CPU.  The current thread is not put to sleep and
    may be scheduled again immediately at the scheduler's whim. */
@@ -463,11 +524,16 @@ init_thread (struct thread *t, const char *name, int priority)
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
   t->magic = THREAD_MAGIC;
+#ifdef USERPROG
+  list_init(&t->proc_file_list);
+  list_init(&t->proc_child_list);
+#endif
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
   intr_set_level (old_level);
 }
+
 
 /* Allocates a SIZE-byte frame at the top of thread T's stack and
    returns a pointer to the frame's base. */

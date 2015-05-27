@@ -17,9 +17,98 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/malloc.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+
+/* loading synch. we execute one by one. so we may use global variable */
+static struct lock exec_lock;
+static struct semaphore load_sema;
+static int load_result;
+
+/* File management */
+struct process_file {
+	int fd;
+	struct file *f;
+	struct list_elem elem;
+};
+int
+process_file_open (char *filename)
+{
+	struct thread *t = thread_current ();
+	struct process_file *pf;
+	int fd;
+
+	/* open */
+	struct file *f = filesys_open (filename);
+	if (f == NULL)
+		return -1;
+
+	/* decide file descriptor */
+	if (!list_empty(&t->proc_file_list)) {
+		struct process_file *pfback;
+		struct list_elem *e;
+		e = list_back(&t->proc_file_list);
+		pfback = list_entry(e, struct process_file, elem);
+		fd = pfback->fd + 1;
+	} else {
+		fd = 3;
+	}
+
+	/* add element */
+	pf = (struct process_file*)calloc (1, sizeof(struct thread));
+	if (pf == NULL)
+		return -1;
+	pf->fd = fd;
+	pf->f = f;
+	list_push_back (&t->proc_file_list, &pf->elem);
+
+	return fd;
+}
+static struct process_file *
+process_file_find_ (int fd)
+{
+	struct thread *t = thread_current ();
+	struct process_file *pf;
+	struct list_elem *e;
+
+	for (e = list_begin (&t->proc_file_list);
+		e != list_end (&t->proc_file_list);
+		e = list_next (e)) {
+		pf = list_entry(e, struct process_file, elem);
+		if (pf->fd == fd)
+			return pf;
+	}
+	return NULL;
+}
+struct file *
+process_file_find (int fd)
+{
+	struct process_file *pf = process_file_find_(fd);
+	if (pf == NULL)
+		return NULL;
+	return pf->f;
+}
+void
+process_file_close (int fd)
+{
+	struct process_file *pf = process_file_find_(fd);
+	if (pf == NULL)
+		return;
+	file_close(pf->f);
+	list_remove(&pf->elem);
+	free(pf);
+	return;
+}
+
+void
+process_init (void)
+{
+	sema_init(&load_sema, 0);
+	lock_init(&exec_lock);
+}
+
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -38,10 +127,20 @@ process_execute (const char *file_name)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
+  /* Prepare sync of Loading */
+  lock_acquire(&exec_lock);
+  load_result = 0;
+
   /* Create a new thread to execute FILE_NAME. */
   tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
-  if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+  if (tid == TID_ERROR) {
+    palloc_free_page (fn_copy);
+  } else {
+	sema_down(&load_sema);
+	if (load_result) /* load fail */
+		tid = -1;
+  }
+  lock_release(&exec_lock);
   return tid;
 }
 
@@ -51,8 +150,19 @@ static void
 start_process (void *file_name_)
 {
   char *file_name = file_name_;
+  char *split;
+  int len_command;
   struct intr_frame if_;
   bool success;
+
+  /* split file name and argument */
+  while (*file_name == ' ') /* skip spaces */
+	   file_name++;
+  len_command = strlen(file_name);
+  split = file_name;
+  while (*split != ' ' && *split != '\0') /* skip file name */
+	  split++;
+  *split = '\0';	/* split */
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -61,8 +171,57 @@ start_process (void *file_name_)
   if_.eflags = FLAG_IF | FLAG_MBS;
   success = load (file_name, &if_.eip, &if_.esp);
 
+  /* set arguments */
+  if(success){
+	char *args;
+	char *c;
+	char** argv;
+	int argc = 0;
+	int new_char = 0;
+
+	/* argument data copy */
+	args = (char*)if_.esp - ((len_command + 1 + 3) & (~3)); /* 4 byte align */
+	memcpy(args, file_name, len_command + 1);
+
+	/* set argv[argc] = NULL */
+	argv = (char**)args;
+	*(--argv) = NULL;
+
+	/* parse arguments from the tail */
+	for (c = args + len_command - 1; c > args; c--) {
+		if (*c == ' ')
+			*c = '\0';
+		if (new_char && *c == '\0') {
+			/* add argument at c+1 (set argv[1..]) */
+			*(--argv) = c+1;
+			argc++;
+			new_char = 0;
+		} else if (*c != '\0') {
+			new_char = 1;
+		}
+	}
+	if (new_char) {
+		/* add argument at c (set argv[0]) */
+		*(--argv) = c;
+		argc++;
+	}
+
+	/* set argv */
+	c = (char*)argv;
+	*(--argv) = c;
+
+	/* set argc */
+	*((int *)(--argv)) = argc;
+
+	/* alloc return value */
+	*((int *)(--argv)) = 0;
+
+	/* move esp */
+	if_.esp = argv;
+  }
+
   /* If load failed, quit. */
-  palloc_free_page (file_name);
+  palloc_free_page (file_name_);
   if (!success) 
     thread_exit ();
 
@@ -81,14 +240,32 @@ start_process (void *file_name_)
    exception), returns -1.  If TID is invalid or if it was not a
    child of the calling process, or if process_wait() has already
    been successfully called for the given TID, returns -1
-   immediately, without waiting.
-
-   This function will be implemented in problem 2-2.  For now, it
-   does nothing. */
+   immediately, without waiting. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid) 
 {
-  return -1;
+	struct thread *cur = thread_current ();
+	struct thread *t;
+	int exit_code;
+
+	t = thread_find_child (cur, child_tid);
+	if (!t)
+		goto error_end;
+
+	/* wait exit code from child */
+	sema_down(&t->release_on_exit);
+	exit_code = t->exit_code;
+	
+	/* for multiple-wait */
+	t->exit_code = -1;
+	sema_up(&t->release_on_exit);
+
+	/* now the child may terminated */
+	sema_up(&t->release_on_wait);
+	return exit_code;
+
+error_end:
+	return -1;
 }
 
 /* Free the current process's resources. */
@@ -114,6 +291,28 @@ process_exit (void)
       pagedir_activate (NULL);
       pagedir_destroy (pd);
     }
+
+  /* close opened files */
+  {
+	struct process_file *pf;
+	while (!list_empty(&cur->proc_file_list)) {
+		pf = list_entry(list_pop_front(&cur->proc_file_list), struct process_file, elem);
+		file_close(pf->f);
+		free(pf);
+	}
+	if (cur->exe_file)
+		file_close(cur->exe_file);
+  }
+
+  /* if not initial thread */
+  if (cur->proc_parent)
+  {
+	printf ("%s: exit(%d)\n", cur->name, cur->exit_code );
+
+	sema_up(&cur->release_on_exit);
+	sema_down(&cur->release_on_wait); /* parent must wait before removing this thread */
+	list_remove(&cur->proc_child_elem);
+  }
 }
 
 /* Sets up the CPU for running user code in the current
@@ -312,7 +511,15 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  if (success) {
+	file_deny_write (file);
+	t->exe_file = file;
+  }
+  else {
+	file_close (file);
+	load_result = -1;
+  }
+  sema_up(&load_sema);
   return success;
 }
 
@@ -463,3 +670,5 @@ install_page (void *upage, void *kpage, bool writable)
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
 }
+
+
